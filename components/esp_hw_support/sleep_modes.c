@@ -379,6 +379,20 @@ static uint32_t IRAM_ATTR esp_sleep_start(uint32_t pd_flags)
         suspend_uarts();
     }
 
+#if SOC_RTC_SLOW_CLOCK_SUPPORT_8MD256
+    //Keep the RTC8M_CLK on if RTC clock is 8MD256.
+    bool rtc_using_8md256 = (rtc_clk_slow_freq_get() == RTC_SLOW_FREQ_8MD256);
+#else
+    bool rtc_using_8md256 = false;
+#endif
+    //Keep the RTC8M_CLK on if the ledc low-speed channel is clocked by RTC8M_CLK in lightsleep mode
+    bool dig_8m_enabled = !deep_sleep && rtc_dig_8m_enabled();
+
+    //Override user-configured power modes.
+    if (rtc_using_8md256 || dig_8m_enabled) {
+        pd_flags &= ~RTC_SLEEP_PD_INT_8M;
+    }
+
     // Save current frequency and switch to XTAL
     rtc_cpu_freq_config_t cpu_freq_config;
     rtc_clk_cpu_freq_get_config(&cpu_freq_config);
@@ -400,10 +414,14 @@ static uint32_t IRAM_ATTR esp_sleep_start(uint32_t pd_flags)
     }
 #endif
 
-#ifdef CONFIG_IDF_TARGET_ESP32
+#if CONFIG_ULP_COPROC_ENABLED
     // Enable ULP wakeup
     if (s_config.wakeup_triggers & RTC_ULP_TRIG_EN) {
+#ifdef CONFIG_IDF_TARGET_ESP32
         rtc_hal_ulp_wakeup_enable();
+#else
+        rtc_hal_ulp_int_clear();
+#endif
     }
 #endif
 
@@ -431,6 +449,7 @@ static uint32_t IRAM_ATTR esp_sleep_start(uint32_t pd_flags)
         }
     }
 #endif
+
     uint32_t reject_triggers = 0;
     if ((pd_flags & RTC_SLEEP_PD_DIG) == 0 && (s_config.wakeup_triggers & RTC_GPIO_TRIG_EN)) {
         /* Light sleep, enable sleep reject for faster return from this function,
@@ -549,7 +568,7 @@ void IRAM_ATTR esp_deep_sleep_start(void)
     // Correct the sleep time
     s_config.sleep_time_adjustment = DEEP_SLEEP_TIME_OVERHEAD_US;
 
-    uint32_t force_pd_flags = RTC_SLEEP_PD_DIG | RTC_SLEEP_PD_VDDSDIO;
+    uint32_t force_pd_flags = RTC_SLEEP_PD_DIG | RTC_SLEEP_PD_VDDSDIO | RTC_SLEEP_PD_INT_8M | RTC_SLEEP_PD_XTAL;
 
 #if SOC_PM_SUPPORT_WIFI_PD
     force_pd_flags |= RTC_SLEEP_PD_WIFI;
@@ -1184,10 +1203,14 @@ static uint32_t get_power_down_flags(void)
 #if SOC_RTC_SLOW_MEM_SUPPORTED && SOC_ULP_SUPPORTED
     // Labels are defined in the linker script
     extern int _rtc_slow_length;
+    /**
+     * Compiler considers "(size_t) &_rtc_slow_length > 0" to always be true.
+     * So use a volatile variable to prevent compiler from doing this optimization.
+     */
+    volatile size_t rtc_slow_mem_used = (size_t)&_rtc_slow_length;
 
     if ((s_config.pd_options[ESP_PD_DOMAIN_RTC_SLOW_MEM] == ESP_PD_OPTION_AUTO) &&
-            ((size_t) &_rtc_slow_length > 0 ||
-             (s_config.wakeup_triggers & RTC_ULP_TRIG_EN))) {
+            (rtc_slow_mem_used > 0 || (s_config.wakeup_triggers & RTC_ULP_TRIG_EN))) {
         s_config.pd_options[ESP_PD_DOMAIN_RTC_SLOW_MEM] = ESP_PD_OPTION_ON;
     }
 #endif
